@@ -1,0 +1,111 @@
+digraph KiroSpec {
+    graph [
+        goal="Turn GitHub issue {{ inputs.issue }} into a ready-to-implement Kiro spec — brief, requirements, design, and tasks — delivered as a stack of four pull requests.",
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    prepare [
+        label="Prepare",
+        shape=parallelogram,
+        output_schema="routing",
+        goal_gate=true,
+        script="test -f .git/kiro-spec-scripts/tools.py || { echo 'kiro-spec: helper scripts are missing (fresh sandbox on resume?); start a new run instead of resuming this one' >&2; exit 1; }\npython3 .git/kiro-spec-scripts/tools.py prepare {{ inputs.issue }} {{ inputs.spec }} {{ inputs.base }} {{ inputs.trunk }}"
+    ]
+
+    brief [
+        label="Write brief",
+        prompt="@prompts/brief.md",
+        output_schema="routing"
+    ]
+
+    lock_brief [
+        label="Lock brief layer",
+        shape=parallelogram,
+        script="python3 .git/kiro-spec-scripts/tools.py lock brief 1"
+    ]
+
+    requirements [
+        label="Write requirements",
+        prompt="@prompts/requirements.md",
+        output_schema="routing"
+    ]
+
+    lock_requirements [
+        label="Lock requirements layer",
+        shape=parallelogram,
+        script="python3 .git/kiro-spec-scripts/tools.py lock requirements 2"
+    ]
+
+    design [
+        label="Write design",
+        prompt="@prompts/design.md",
+        output_schema="routing"
+    ]
+
+    lock_design [
+        label="Lock design layer",
+        shape=parallelogram,
+        script="python3 .git/kiro-spec-scripts/tools.py lock design 3"
+    ]
+
+    tasks [
+        label="Write tasks",
+        prompt="@prompts/tasks.md",
+        output_schema="routing"
+    ]
+
+    lock_tasks [
+        label="Lock tasks layer",
+        shape=parallelogram,
+        script="python3 .git/kiro-spec-scripts/tools.py lock tasks 4"
+    ]
+
+    publish [
+        label="Publish PR stack",
+        shape=parallelogram,
+        goal_gate=true,
+        script="python3 .git/kiro-spec-scripts/tools.py publish"
+    ]
+
+    fail [
+        label="Fail run",
+        shape=parallelogram,
+        stdin_source="stage_failure",
+        script="set -eu\nMSG=$(cat || true)\nif [ -z \"$MSG\" ]; then\n  MSG=\"a kiro-spec stage failed; inspect the failing stage output in the run events and .git/kiro-spec-state.json\"\nfi\nprintf 'kiro-spec: %s\\n' \"$MSG\" >&2\nexit 1"
+    ]
+
+    start -> prepare
+
+    prepare -> brief [condition="outcome=succeeded && context.next_doc=brief"]
+    prepare -> requirements [condition="outcome=succeeded && context.next_doc=requirements"]
+    prepare -> design [condition="outcome=succeeded && context.next_doc=design"]
+    prepare -> tasks [condition="outcome=succeeded && context.next_doc=tasks"]
+    prepare -> publish [condition="outcome=succeeded && context.next_doc=publish"]
+    prepare -> fail
+
+    brief -> lock_brief [condition="outcome=succeeded"]
+    brief -> fail
+    lock_brief -> requirements [condition="outcome=succeeded"]
+    lock_brief -> fail
+
+    requirements -> lock_requirements [condition="outcome=succeeded"]
+    requirements -> fail
+    lock_requirements -> design [condition="outcome=succeeded"]
+    lock_requirements -> fail
+
+    design -> lock_design [condition="outcome=succeeded"]
+    design -> fail
+    lock_design -> tasks [condition="outcome=succeeded"]
+    lock_design -> fail
+
+    tasks -> lock_tasks [condition="outcome=succeeded"]
+    tasks -> fail
+    lock_tasks -> publish [condition="outcome=succeeded"]
+    lock_tasks -> fail
+
+    publish -> exit
+    fail -> exit
+}
