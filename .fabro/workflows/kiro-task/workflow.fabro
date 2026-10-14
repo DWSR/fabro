@@ -1,0 +1,61 @@
+digraph KiroTask {
+    graph [
+        goal="Complete Kiro task {{ inputs.task }} of spec {{ inputs.spec }} to completion: implement it with TDD, review it adversarially, then mark it complete and commit.",
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    guard [
+        label="Validate task",
+        shape=parallelogram,
+        output_schema="routing",
+        goal_gate=true,
+        script="set -eu\nSPEC={{ inputs.spec }}\nTASK={{ inputs.task }}\nfail() { printf 'kiro-task guard: %s\\n' \"$1\" >&2; exit 1; }\n[ -n \"$SPEC\" ] || fail 'input \"spec\" is empty'\n[ -n \"$TASK\" ] || fail 'input \"task\" is empty'\nSPEC_DIR=\".kiro/specs/$SPEC\"\nfor f in spec.json requirements.md design.md tasks.md; do\n  [ -f \"$SPEC_DIR/$f\" ] || fail \"missing $SPEC_DIR/$f\"\ndone\nESC_ID=$(printf '%s' \"$TASK\" | sed 's/\\./\\\\./g')\nPAT=\"^- \\\\[[ x]*\\\\][*]?[[:space:]]+${ESC_ID}(\\.?[[:space:]]|$)\"\nLINE=$(grep -nE \"$PAT\" \"$SPEC_DIR/tasks.md\" | head -n1 | cut -d: -f1)\nif [ -z \"$LINE\" ]; then\n  NEAR=$(grep -oE \"^- \\\\[[ x]*\\\\][*]?[[:space:]]+${ESC_ID}[0-9]+([.][0-9]+)?\" \"$SPEC_DIR/tasks.md\" | head -n1 | sed -E 's/^-[[:space:]]+\\[[ x]*\\][*]?[[:space:]]+//')\n  if [ -n \"$NEAR\" ]; then\n    fail \"task $TASK not found; tasks.md contains task $NEAR (numeric task inputs lose trailing zeros; pass the task as a JSON string)\"\n  fi\n  fail \"task $TASK not found in $SPEC_DIR/tasks.md\"\nfi\nTASK_LINE=$(sed -n \"${LINE}p\" \"$SPEC_DIR/tasks.md\")\ncase \"$TASK_LINE\" in *'[x]'*) fail \"task $TASK is already checked\" ;; esac\nBLOCK=$(awk -v s=\"$LINE\" 'NR>=s { if (NR>s && /^- \\[[^]]*\\]/) exit; print }' \"$SPEC_DIR/tasks.md\")\nprintf '%s\\n' \"$BLOCK\" | grep -q '_Blocked:' && fail \"task $TASK is marked blocked\"\nDEPS=$(printf '%s\\n' \"$BLOCK\" | sed -n 's/.*_Depends:[[:space:]]*//p' | head -n1)\nfor dep in $(printf '%s' \"$DEPS\" | tr ',' ' '); do\n  DEP=$(printf '%s' \"$dep\" | tr -d '[:space:]_')\n  [ -n \"$DEP\" ] || continue\n  ESC_DEP=$(printf '%s' \"$DEP\" | sed 's/\\./\\\\./g')\n  DEP_LINE=$(grep -E \"^- \\\\[[ x]*\\\\][*]?[[:space:]]+${ESC_DEP}(\\.?[[:space:]]|$)\" \"$SPEC_DIR/tasks.md\" | head -n1)\n  [ -n \"$DEP_LINE\" ] || fail \"dependency $DEP not found in tasks.md\"\n  case \"$DEP_LINE\" in *'[x]'*) : ;; *) fail \"dependency $DEP is not complete\" ;; esac\ndone\nprintf '{\"context_updates\":{\"baseline_sha\":\"%s\"}}\\n' \"$(git rev-parse HEAD)\""
+    ]
+
+    implement [
+        label="Implement",
+        prompt="@prompts/implement.md",
+        output_schema="routing",
+        goal_gate=true,
+        max_visits=5
+    ]
+
+    review [
+        label="Review",
+        prompt="@prompts/review.md",
+        output_schema="routing",
+        goal_gate=true,
+        max_visits=5
+    ]
+
+    complete [
+        label="Mark complete and commit",
+        shape=parallelogram,
+        goal_gate=true,
+        script="set -eu\nSPEC={{ inputs.spec }}\nTASK={{ inputs.task }}\nTASKS_FILE=\".kiro/specs/$SPEC/tasks.md\"\nfail() { printf 'kiro-task complete: %s\\n' \"$1\" >&2; exit 1; }\n[ -f \"$TASKS_FILE\" ] || fail \"missing $TASKS_FILE\"\nESC_ID=$(printf '%s' \"$TASK\" | sed 's/\\./\\\\./g')\nPAT=\"^- \\\\[[ x]*\\\\][*]?[[:space:]]+${ESC_ID}(\\.?[[:space:]]|$)\"\nLINE=$(grep -nE \"$PAT\" \"$TASKS_FILE\" | head -n1 | cut -d: -f1)\n[ -n \"$LINE\" ] || fail \"task $TASK not found in $TASKS_FILE\"\nTASK_LINE=$(sed -n \"${LINE}p\" \"$TASKS_FILE\")\ncase \"$TASK_LINE\" in *'[x]'*) fail \"task $TASK is already checked\" ;; esac\nDESC=$(printf '%s\\n' \"$TASK_LINE\" | sed -E \"s/^-[[:space:]]+\\[[ x]*\\][*]?[[:space:]]+${ESC_ID}\\.?[[:space:]]+//\")\nawk -v n=\"$LINE\" 'NR==n{sub(/\\[ \\]/,\"[x]\")} {print}' \"$TASKS_FILE\" > \"$TASKS_FILE.tmp\"\nmv \"$TASKS_FILE.tmp\" \"$TASKS_FILE\"\ngit add -u\nif git diff --cached --quiet; then\n  printf 'no staged changes; task marked but nothing to commit\\n'\n  exit 0\nfi\nIDENT=\"\"\nif [ -z \"$(git config user.email || true)\" ]; then\n  IDENT=\"-c user.name=Fabro -c user.email=noreply@fabro.sh\"\nfi\ngit $IDENT commit --no-gpg-sign -m \"feat($SPEC): $DESC\" -m \"Kiro task $TASK from spec $SPEC.\"\nprintf 'task %s marked complete and committed: feat(%s): %s\\n' \"$TASK\" \"$SPEC\" \"$DESC\""
+    ]
+
+    blocked [
+        label="Record blocked",
+        prompt="@prompts/blocked.md",
+        output_schema="routing"
+    ]
+
+    start -> guard
+
+    guard -> implement [condition="outcome=succeeded"]
+    guard -> exit
+
+    implement -> review [condition="outcome=succeeded && context.impl_status=READY_FOR_REVIEW"]
+    implement -> blocked
+
+    review -> complete [condition="outcome=succeeded && context.verdict=APPROVED"]
+    review -> implement [condition="outcome=failed && context.verdict=REJECTED && context.internal.node_visit_count < 3"]
+    review -> blocked
+
+    complete -> exit
+    blocked -> exit
+}

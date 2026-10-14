@@ -1,0 +1,27 @@
+_version = 1
+
+[workflow]
+graph = "workflow.fabro"
+
+[run.inputs]
+spec = ""
+task = ""
+
+[run.run_branch]
+enabled = true
+push = true
+
+[run.pull_request]
+enabled = false
+
+[run.checkpoint]
+exclude_globs = [
+    "**/node_modules/**",
+    "**/target/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/.venv/**",
+    "**/__pycache__/**",
+    "**/.cache/**",
+    "**/.pytest_cache/**",
+]
