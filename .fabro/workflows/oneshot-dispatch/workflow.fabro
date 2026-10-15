@@ -1,0 +1,42 @@
+digraph OneshotDispatch {
+    graph [
+        goal="Scan {{ inputs.repo }} for open issues labeled {{ inputs.labels }} and dispatch one {{ inputs.dispatch_workflow }} run per issue.",
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    scan [
+        label="Scan ready issues",
+        shape=parallelogram,
+        language="python",
+        output_schema="routing",
+        goal_gate=true,
+        script="import json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request\n\nQUEUE_PATH = \".git/oneshot-dispatch-queue.json\"\n\n\ndef gh(path):\n    token = os.environ.get(\"GITHUB_TOKEN\", \"\")\n    if not token:\n        sys.exit(\"GITHUB_TOKEN is not set; declare [run.integrations.github.permissions] on this workflow\")\n    base = os.environ.get(\"ONESHOT_DISPATCH_API_BASE\", \"https://api.github.com\").rstrip(\"/\")\n    req = urllib.request.Request(base + path, method=\"GET\", headers={\n        \"Authorization\": \"Bearer %s\" % token,\n        \"Accept\": \"application/vnd.github+json\",\n        \"X-GitHub-Api-Version\": \"2026-03-10\",\n        \"User-Agent\": \"fabro-oneshot-dispatch-workflow\",\n    })\n    try:\n        with urllib.request.urlopen(req, timeout=60) as r:\n            return json.loads(r.read() or b\"[]\")\n    except urllib.error.HTTPError as e:\n        sys.exit(\"GitHub API GET %s failed: HTTP %s\\n%s\" % (path, e.code, e.read().decode(\"utf-8\", \"replace\")[:1000]))\n\n\ndef origin_repo():\n    url = subprocess.run([\"git\", \"config\", \"--get\", \"remote.origin.url\"], capture_output=True, text=True).stdout.strip()\n    m = re.match(r\"(?:https://github\\.com/|git@github\\.com:)([^/]+)/([^/]+?)(?:\\.git)?/?$\", url)\n    if not m:\n        sys.exit(\"cannot derive owner/repo from origin url %r; pass -I repo=<owner/name>\" % url)\n    return m.group(1), m.group(2)\n\n\nrepo_in = {{ inputs.repo }}.strip()\nlabels = {{ inputs.labels }}.strip()\n\nif not labels:\n    sys.exit(\"input 'labels' is empty; pass the label filter, for example -I labels=type/oneshot,fabro-ready\")\n\nif repo_in:\n    m = re.match(r\"^([^/\\s]+)/([^/\\s]+?)(?:\\.git)?$\", repo_in)\n    if not m:\n        sys.exit(\"input 'repo' must be owner/name; got %r\" % repo_in)\n    owner, repo = m.group(1), m.group(2)\nelse:\n    owner, repo = origin_repo()\n\nissues = []\npage = 1\nwhile page <= 10:\n    q = urllib.parse.urlencode({\"state\": \"open\", \"labels\": labels, \"per_page\": 100, \"page\": page})\n    batch = gh(\"/repos/%s/%s/issues?%s\" % (owner, repo, q)) or []\n    issues.extend(i for i in batch if not i.get(\"pull_request\"))\n    if len(batch) < 100:\n        break\n    page += 1\n\nissues.sort(key=lambda i: i.get(\"number\", 0))\nqueue = {\n    \"repo\": \"%s/%s\" % (owner, repo),\n    \"labels\": labels,\n    \"issues\": [\n        {\"number\": i[\"number\"], \"title\": (i.get(\"title\") or \"\").strip(), \"url\": i.get(\"html_url\", \"\")}\n        for i in issues\n    ],\n}\nwith open(QUEUE_PATH, \"w\") as f:\n    json.dump(queue, f, indent=1, sort_keys=True)\n\nprint(\"oneshot-dispatch scan: repo=%s issues=%d labels=%s\" % (queue[\"repo\"], len(queue[\"issues\"]), labels), file=sys.stderr)\nprint(json.dumps({\"context_updates\": {\n    \"has_issues\": \"true\" if queue[\"issues\"] else \"false\",\n    \"issue_count\": str(len(queue[\"issues\"])),\n}}))"
+    ]
+
+    dispatch [
+        label="Dispatch oneshot runs",
+        prompt="@prompts/dispatch.md",
+        output_schema="routing"
+    ]
+
+    fail [
+        label="Fail run",
+        shape=parallelogram,
+        stdin_source="dispatch_failure",
+        script="set -eu\nMSG=$(cat || true)\nif [ -z \"$MSG\" ]; then\n  MSG=\"a oneshot-dispatch stage failed; inspect the failing stage output in the run events and .git/oneshot-dispatch-queue.json\"\nfi\nprintf 'oneshot-dispatch: %s\\n' \"$MSG\" >&2\nexit 1"
+    ]
+
+    start -> scan
+
+    scan -> dispatch [condition="outcome=succeeded && context.has_issues=true"]
+    scan -> exit [condition="outcome=succeeded && context.has_issues=false"]
+    scan -> fail
+
+    dispatch -> exit [condition="outcome=succeeded"]
+    dispatch -> fail
+
+    fail -> exit
+}

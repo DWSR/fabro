@@ -1,0 +1,341 @@
+_version = 1
+
+[workflow]
+graph = "workflow.fabro"
+
+[run.inputs]
+issue = ""
+
+[run.integrations.github]
+permissions = { contents = "write", pull_requests = "write", issues = "write" }
+
+[run.run_branch]
+enabled = true
+push = true
+
+[run.pull_request]
+enabled = false
+
+[run.checkpoint]
+exclude_globs = [
+    "**/node_modules/**",
+    "**/target/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/.venv/**",
+    "**/__pycache__/**",
+    "**/.cache/**",
+    "**/.pytest_cache/**",
+]
+
+[[run.prepare.steps]]
+script = '''
+set -eu
+mkdir -p .git/oneshot-scripts
+cat > .git/oneshot-scripts/tools.py <<'ONESHOT_TOOLS_PY'
+import datetime, json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
+
+READY_LABEL = "fabro-ready"
+RUNNING_LABEL = "fabro-running"
+TYPE_LABEL = "type/oneshot"
+DIFF_LIMIT = 1000
+MAX_SIMPLIFY_ROUNDS = 2
+STATE_PATH = ".git/oneshot-state.json"
+ISSUE_PATH = ".git/oneshot-issue.md"
+PUBLISH_PATH = ".git/oneshot-publish.json"
+
+
+def run(cmd, check=True, env=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if check and r.returncode != 0:
+        sys.exit("command failed: %s\n%s" % (" ".join(cmd), r.stderr.strip()))
+    return r.stdout.strip()
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def load_state():
+    if not os.path.exists(STATE_PATH):
+        sys.exit("state file %s is missing; the prepare stage must run first" % STATE_PATH)
+    with open(STATE_PATH) as f:
+        return json.load(f)
+
+
+def save_state(state):
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+
+
+def gh(method, path, body=None, expect=(200, 201, 204)):
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        sys.exit("GITHUB_TOKEN is not set; declare [run.integrations.github.permissions] on this workflow")
+    base = os.environ.get("ONESHOT_API_BASE", "https://api.github.com").rstrip("/")
+    req = urllib.request.Request(base + path, method=method, headers={
+        "Authorization": "Bearer %s" % token,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2026-03-10",
+        "Content-Type": "application/json",
+        "User-Agent": "fabro-oneshot-workflow",
+    })
+    data = json.dumps(body).encode() if body is not None else None
+    try:
+        with urllib.request.urlopen(req, data=data, timeout=60) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        if e.code in expect:
+            try:
+                return e.code, json.loads(raw)
+            except ValueError:
+                return e.code, raw
+        sys.exit("GitHub API %s %s failed: HTTP %s\n%s" % (method, path, e.code, raw[:1000]))
+
+
+def origin_repo():
+    url = subprocess.run(["git", "config", "--get", "remote.origin.url"], capture_output=True, text=True).stdout.strip()
+    m = re.match(r"(?:https://github\.com/|git@github\.com:)([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+    if not m:
+        sys.exit("cannot derive owner/repo from origin url %r" % url)
+    return m.group(1), m.group(2)
+
+
+def detect_trunk():
+    head = run(["git", "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], check=False)
+    if head.startswith("origin/"):
+        return head.split("/", 1)[1]
+    out = run(["git", "remote", "show", "origin"], check=False)
+    m = re.search(r"HEAD branch:\s*(\S+)", out)
+    return m.group(1) if m else "main"
+
+
+def parse_issue_number(value):
+    m = re.search(r"/issues/(\d+)", value or "")
+    if m:
+        return int(m.group(1))
+    if re.match(r"^#?\d+$", (value or "").strip()):
+        return int(value.strip().lstrip("#"))
+    sys.exit("input 'issue' must be a GitHub issue number (123), #123, or an issue URL; got %r" % value)
+
+
+def write_issue_file(issue, owner, repo, labels):
+    with open(ISSUE_PATH, "w") as f:
+        f.write("# GitHub issue #%d: %s\n\n" % (issue["number"], (issue.get("title") or "").strip()))
+        f.write("- URL: %s\n" % issue.get("html_url", ""))
+        f.write("- State: %s\n" % issue.get("state"))
+        f.write("- Labels: %s\n" % (", ".join(sorted(labels)) or "(none)"))
+        f.write("- Repository: %s/%s\n\n" % (owner, repo))
+        f.write("## Body\n\n%s\n" % (issue.get("body") or "(empty)"))
+
+
+def prepare(argv):
+    issue_number = parse_issue_number(argv[0] if argv else "")
+    owner, repo = origin_repo()
+    run(["git", "fetch", "--prune", "--quiet", "origin"])
+    issue = gh("GET", "/repos/%s/%s/issues/%d" % (owner, repo, issue_number))[1]
+    if issue.get("pull_request"):
+        sys.exit("#%d is a pull request, not an issue" % issue_number)
+    if issue.get("state") != "open":
+        sys.exit("issue #%d is %s; refusing to implement a non-open issue" % (issue_number, issue.get("state")))
+    title = (issue.get("title") or "").strip()
+    if not title:
+        sys.exit("issue #%d has an empty title" % issue_number)
+    labels = set(l.get("name", "") for l in (issue.get("labels") or []))
+
+    state = None
+    if os.path.exists(STATE_PATH):
+        try:
+            with open(STATE_PATH) as f:
+                state = json.load(f)
+        except ValueError:
+            state = None
+    if state is not None and state.get("issue") != issue_number:
+        sys.exit("state file %s describes issue %s, not #%d; start a fresh run" % (STATE_PATH, state.get("issue"), issue_number))
+
+    if state is None:
+        missing = [l for l in (READY_LABEL, TYPE_LABEL) if l not in labels]
+        if missing:
+            sys.exit("issue #%d is not labelled %s (labels: %s); only correctly labelled oneshots may run" % (
+                issue_number, " + ".join(missing), ", ".join(sorted(labels)) or "(none)"))
+        state = {
+            "issue": issue_number,
+            "issue_title": title,
+            "issue_url": issue.get("html_url", ""),
+            "repo": "%s/%s" % (owner, repo),
+            "trunk": detect_trunk(),
+            "baseline_sha": run(["git", "rev-parse", "HEAD"]),
+            "simplify_round": 0,
+            "created_at": now_iso(),
+        }
+        gh("POST", "/repos/%s/%s/issues/%d/labels" % (owner, repo, issue_number), {"labels": [RUNNING_LABEL]})
+        gh("DELETE", "/repos/%s/%s/issues/%d/labels/%s" % (owner, repo, issue_number, urllib.parse.quote(READY_LABEL, safe="")))
+    else:
+        gh("POST", "/repos/%s/%s/issues/%d/labels" % (owner, repo, issue_number), {"labels": [RUNNING_LABEL]})
+
+    state["issue_title"] = title
+    state["issue_url"] = issue.get("html_url", "")
+    write_issue_file(issue, owner, repo, labels)
+    save_state(state)
+
+    print("oneshot prepare: issue=#%d trunk=%s baseline=%s" % (
+        issue_number, state["trunk"], state["baseline_sha"][:12]), file=sys.stderr)
+    print(json.dumps({"context_updates": {
+        "issue_number": str(issue_number),
+        "issue_title": title,
+        "trunk": state["trunk"],
+        "baseline_sha": state["baseline_sha"],
+    }}))
+
+
+def check(argv):
+    state = load_state()
+    baseline = state.get("baseline_sha")
+    if not baseline:
+        sys.exit("state file %s has no baseline_sha; start a fresh run" % STATE_PATH)
+    run(["git", "add", "-A"])
+    out = run(["git", "diff", "--cached", "--numstat", baseline])
+    added = deleted = files = 0
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        files += 1
+        if parts[0] == "-" or parts[1] == "-":
+            continue
+        added += int(parts[0])
+        deleted += int(parts[1])
+    lines = added + deleted
+    if files == 0:
+        sys.exit("no changes vs baseline %s; the implementation stage produced nothing to publish" % baseline[:12])
+
+    state["last_diff_lines"] = lines
+    state["last_diff_files"] = files
+
+    if lines < DIFF_LIMIT:
+        save_state(state)
+        print("oneshot check: %d lines across %d files; under the %d-line limit" % (lines, files, DIFF_LIMIT), file=sys.stderr)
+        print(json.dumps({"context_updates": {
+            "over_limit": "false",
+            "diff_lines": str(lines),
+            "diff_files": str(files),
+        }}))
+        return
+
+    round_ = int(state.get("simplify_round") or 0) + 1
+    state["simplify_round"] = round_
+    can_simplify = round_ <= MAX_SIMPLIFY_ROUNDS
+    save_state(state)
+    print("oneshot check: %d lines across %d files; over the %d-line limit (simplify round %d of %d)" % (
+        lines, files, DIFF_LIMIT, round_, MAX_SIMPLIFY_ROUNDS), file=sys.stderr)
+    updates = {
+        "over_limit": "true",
+        "can_simplify": "true" if can_simplify else "false",
+        "diff_lines": str(lines),
+        "diff_files": str(files),
+        "simplify_round": str(round_),
+    }
+    if not can_simplify:
+        updates["stage_failure"] = (
+            "issue #%s still needs %d changed lines across %d files after %d simplification rounds "
+            "(limit %d; a modified line counts as one addition plus one deletion): the issue is too large "
+            "for a oneshot, split it and re-add the %s label" % (
+                state.get("issue"), lines, files, MAX_SIMPLIFY_ROUNDS, DIFF_LIMIT, READY_LABEL))
+    print(json.dumps({"context_updates": updates}))
+
+
+def load_publish_meta(issue_number, state):
+    title = "oneshot(#%d): %s" % (issue_number, state.get("issue_title") or "implement issue")
+    summary = "Implements the change requested in issue #%d." % issue_number
+    if os.path.exists(PUBLISH_PATH):
+        try:
+            with open(PUBLISH_PATH) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                proposed = " ".join(str(data.get("title") or "").split())
+                if proposed:
+                    title = proposed
+                proposed_summary = str(data.get("summary") or "").strip()
+                if proposed_summary:
+                    summary = proposed_summary
+        except ValueError:
+            pass
+    return title, summary
+
+
+def publish(argv):
+    state = load_state()
+    owner, repo = origin_repo()
+    slug = "%s/%s" % (owner, repo)
+    issue_number = state["issue"]
+    trunk = state.get("trunk") or detect_trunk()
+    branch = "oneshot/issue-%d" % issue_number
+    title, summary = load_publish_meta(issue_number, state)
+
+    run(["git", "add", "-A"])
+    if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 1:
+        ident = []
+        if not run(["git", "config", "user.email"], check=False):
+            ident = ["-c", "user.name=Fabro", "-c", "user.email=noreply@fabro.sh"]
+        run(["git"] + ident + ["commit", "--no-gpg-sign", "-m", title])
+
+    subprocess.run(["git", "fetch", "--quiet", "origin",
+                    "refs/heads/%s:refs/remotes/origin/%s" % (branch, branch)], capture_output=True, text=True)
+    run(["git", "push", "--quiet", "--force-with-lease", "origin", "HEAD:refs/heads/%s" % branch])
+
+    def find_open_pr():
+        query = urllib.parse.urlencode({"state": "open", "head": "%s:%s" % (owner, branch), "per_page": 100})
+        _, prs = gh("GET", "/repos/%s/pulls?%s" % (slug, query))
+        prs = prs or []
+        if len(prs) > 1:
+            sys.exit("multiple open pull requests for head %s: %s" % (branch, [p["number"] for p in prs]))
+        return prs[0] if prs else None
+
+    pr = find_open_pr()
+    if pr is None:
+        body = "%s\n\nCloses #%d\n" % (summary, issue_number)
+        status, created = gh("POST", "/repos/%s/pulls" % slug, {
+            "title": title,
+            "head": branch,
+            "base": trunk,
+            "draft": False,
+            "body": body,
+        }, expect=(201, 422))
+        if status == 422:
+            pr = find_open_pr()
+            if pr is None:
+                sys.exit("pull request create for head %s returned 422 and no open PR exists" % branch)
+        else:
+            pr = created
+        print("oneshot publish: created PR #%s %s -> %s" % (pr.get("number"), branch, trunk), file=sys.stderr)
+    else:
+        print("oneshot publish: reusing PR #%s for %s" % (pr.get("number"), branch), file=sys.stderr)
+
+    print(json.dumps({"context_updates": {
+        "pr_number": str(pr.get("number")),
+        "pr_url": pr.get("html_url", ""),
+    }}))
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit("usage: tools.py <prepare|check|publish> [args]")
+    cmd, rest = sys.argv[1], sys.argv[2:]
+    if cmd == "prepare":
+        prepare(rest)
+    elif cmd == "check":
+        check(rest)
+    elif cmd == "publish":
+        publish(rest)
+    else:
+        sys.exit("unknown command %r" % cmd)
+
+
+if __name__ == "__main__":
+    main()
+ONESHOT_TOOLS_PY
+python3 -c "import py_compile; py_compile.compile('.git/oneshot-scripts/tools.py', doraise=True)"
+echo "oneshot: helper scripts ready" >&2
+'''

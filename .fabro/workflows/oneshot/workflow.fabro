@@ -1,0 +1,82 @@
+digraph Oneshot {
+    graph [
+        goal="Implement GitHub issue {{ inputs.issue }} as a oneshot change: implement it, keep the Git diff under 1000 lines (simplifying at most twice), review it adversarially, and open a pull request whose body closes the issue.",
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    prepare [
+        label="Validate labels and prepare",
+        shape=parallelogram,
+        output_schema="routing",
+        goal_gate=true,
+        script="test -f .git/oneshot-scripts/tools.py || { echo 'oneshot: helper scripts are missing (fresh sandbox on resume?); start a new run instead of resuming this one' >&2; exit 1; }\npython3 .git/oneshot-scripts/tools.py prepare {{ inputs.issue }}"
+    ]
+
+    implement [
+        label="Implement issue",
+        prompt="@prompts/implement.md",
+        output_schema="routing",
+        max_visits=5
+    ]
+
+    check [
+        label="Check diff size",
+        shape=parallelogram,
+        output_schema="routing",
+        max_visits=6,
+        script="python3 .git/oneshot-scripts/tools.py check"
+    ]
+
+    simplify [
+        label="Simplify change",
+        prompt="@prompts/simplify.md",
+        output_schema="routing",
+        max_visits=2
+    ]
+
+    review [
+        label="Review change",
+        prompt="@prompts/review.md",
+        output_schema="routing",
+        max_visits=5
+    ]
+
+    publish [
+        label="Publish pull request",
+        shape=parallelogram,
+        goal_gate=true,
+        script="python3 .git/oneshot-scripts/tools.py publish"
+    ]
+
+    fail [
+        label="Fail run",
+        shape=parallelogram,
+        stdin_source="stage_failure",
+        script="set -eu\nMSG=$(cat || true)\nif [ -z \"$MSG\" ]; then\n  MSG=\"a oneshot stage failed; inspect the failing stage output in the run events and .git/oneshot-state.json\"\nfi\nprintf 'oneshot: %s\\n' \"$MSG\" >&2\nexit 1"
+    ]
+
+    start -> prepare
+
+    prepare -> implement [condition="outcome=succeeded"]
+    prepare -> fail
+
+    implement -> check [condition="outcome=succeeded && context.impl_status=READY"]
+    implement -> fail
+
+    check -> review [condition="outcome=succeeded && context.over_limit=false"]
+    check -> simplify [condition="outcome=succeeded && context.over_limit=true && context.can_simplify=true"]
+    check -> fail
+
+    simplify -> check [condition="outcome=succeeded"]
+    simplify -> fail
+
+    review -> publish [condition="outcome=succeeded && context.verdict=APPROVED"]
+    review -> implement [condition="outcome=failed && context.verdict=REJECTED && context.internal.node_visit_count < 3"]
+    review -> fail
+
+    publish -> exit
+    fail -> exit
+}
