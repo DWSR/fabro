@@ -43,8 +43,8 @@ STATE_PATH = ".git/kiro-spec-state.json"
 ISSUE_PATH = ".git/kiro-spec-issue.md"
 
 
-def run(cmd, check=True):
-    r = subprocess.run(cmd, capture_output=True, text=True)
+def run(cmd, check=True, env=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if check and r.returncode != 0:
         sys.exit("command failed: %s\n%s" % (" ".join(cmd), r.stderr.strip()))
     return r.stdout.strip()
@@ -301,16 +301,29 @@ def lock(argv):
             json.dump(meta, f, indent=2)
             f.write("\n")
 
-    run(["git", "add", "-A", "--", spec_dir])
-    if run(["git", "status", "--porcelain", "--", spec_dir], check=True).strip():
-        ident = []
-        if not run(["git", "config", "user.email"], check=False):
-            ident = ["-c", "user.name=Fabro", "-c", "user.email=noreply@fabro.sh"]
-        run(["git"] + ident + ["commit", "--no-gpg-sign", "--no-verify", "-m", "docs(%s): add %s" % (spec, doc)])
+    if layer > 1 and len(layers) < layer - 1:
+        sys.exit("cannot lock layer %d: earlier layers are missing from the state file" % layer)
+    base_name = state["stack_base"] if layer == 1 else layers[layer - 2]["branch"]
+    base = run(["git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/%s^{commit}" % base_name], check=False)
+    if not base:
+        sys.exit("base branch origin/%s is not available locally; fetch it and retry" % base_name)
 
-    tip = run(["git", "rev-parse", "HEAD"])
+    index = os.path.join(".git", "kiro-spec-lock-index")
+    if os.path.exists(index):
+        os.remove(index)
+    env = dict(os.environ, GIT_INDEX_FILE=index)
+    run(["git", "read-tree", base], env=env)
+    run(["git", "add", "-A", "--", spec_dir], env=env)
+    tree = run(["git", "write-tree"], env=env)
+    os.remove(index)
+
+    ident = []
+    if not run(["git", "config", "user.email"], check=False):
+        ident = ["-c", "user.name=Fabro", "-c", "user.email=noreply@fabro.sh"]
+    tip = run(["git"] + ident + ["commit-tree", tree, "-p", base, "-m", "docs(%s): add %s" % (spec, doc)])
+
     branch = "stack/%s/%d-%s" % (spec, layer, doc)
-    run(["git", "push", "--quiet", "origin", "HEAD:refs/heads/%s" % branch])
+    run(["git", "push", "--quiet", "--force-with-lease", "origin", "%s:refs/heads/%s" % (tip, branch)])
 
     layers.append({"layer": layer, "doc": doc, "branch": branch, "sha": tip})
     layers.sort(key=lambda l: l["layer"])
