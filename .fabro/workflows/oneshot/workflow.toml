@@ -33,7 +33,7 @@ script = '''
 set -eu
 mkdir -p .git/oneshot-scripts
 cat > .git/oneshot-scripts/tools.py <<'ONESHOT_TOOLS_PY'
-import datetime, json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
+import datetime, hashlib, json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
 
 READY_LABEL = "fabro-ready"
 RUNNING_LABEL = "fabro-running"
@@ -131,6 +131,66 @@ def write_issue_file(issue, owner, repo, labels):
         f.write("## Body\n\n%s\n" % (issue.get("body") or "(empty)"))
 
 
+def issue_fingerprint(title, body):
+    canonical = json.dumps({"title": title, "body": body or ""}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def meta_branch(issue_number):
+    return "oneshot-meta/issue-%d" % issue_number
+
+
+def load_meta(issue_number):
+    ref = "refs/heads/%s" % meta_branch(issue_number)
+    out = run(["git", "ls-remote", "--heads", "origin", ref], check=False)
+    sha = None
+    for line in out.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[1] == ref:
+            sha = parts[0]
+    if sha is None:
+        return None, None
+    run(["git", "fetch", "--quiet", "origin", ref])
+    raw = run(["git", "show", "FETCH_HEAD:fingerprint.json"], check=False)
+    try:
+        meta = json.loads(raw)
+    except ValueError:
+        meta = None
+    if not isinstance(meta, dict) or not isinstance(meta.get("fingerprint"), str) or not meta["fingerprint"]:
+        sys.exit("fingerprint branch %s is unreadable; delete it (and branch oneshot/issue-%d if it exists) and re-dispatch" % (
+            meta_branch(issue_number), issue_number))
+    return meta, sha
+
+
+def record_fingerprint(issue_number, fingerprint, meta_sha):
+    ref = "refs/heads/%s" % meta_branch(issue_number)
+    path = os.path.join(".git", "oneshot-fingerprint.json")
+    with open(path, "w") as f:
+        json.dump({
+            "fingerprint": fingerprint,
+            "issue": issue_number,
+            "recorded_at": now_iso(),
+        }, f, indent=2, sort_keys=True)
+        f.write("\n")
+    blob = run(["git", "hash-object", "-w", path])
+    os.remove(path)
+
+    index = os.path.join(".git", "oneshot-meta-index")
+    if os.path.exists(index):
+        os.remove(index)
+    env = dict(os.environ, GIT_INDEX_FILE=index)
+    run(["git", "update-index", "--add", "--cacheinfo", "100644", blob, "fingerprint.json"], env=env)
+    tree = run(["git", "write-tree"], env=env)
+    os.remove(index)
+
+    ident = []
+    if not run(["git", "config", "user.email"], check=False):
+        ident = ["-c", "user.name=Fabro", "-c", "user.email=noreply@fabro.sh"]
+    tip = run(["git"] + ident + ["commit-tree", tree, "-m", "oneshot(#%d): record issue fingerprint" % issue_number])
+    run(["git", "push", "--quiet", "--force-with-lease=%s:%s" % (ref, meta_sha or ""), "origin", "%s:%s" % (tip, ref)])
+    print("oneshot prepare: recorded issue fingerprint %s at %s (%s)" % (fingerprint[:12], ref, tip[:12]), file=sys.stderr)
+
+
 def prepare(argv):
     issue_number = parse_issue_number(argv[0] if argv else "")
     owner, repo = origin_repo()
@@ -155,11 +215,33 @@ def prepare(argv):
     if state is not None and state.get("issue") != issue_number:
         sys.exit("state file %s describes issue %s, not #%d; start a fresh run" % (STATE_PATH, state.get("issue"), issue_number))
 
+    fingerprint = issue_fingerprint(title, issue.get("body"))
+    meta, meta_sha = load_meta(issue_number)
+
+    if state is not None:
+        if meta is None:
+            sys.exit("run state for issue #%d exists but no fingerprint is recorded at %s; cannot verify it matches the current issue (start a new run instead of resuming this one)" % (
+                issue_number, meta_branch(issue_number)))
+        if meta.get("fingerprint") != fingerprint:
+            sys.exit("issue #%d changed after this oneshot run started (fingerprint %s recorded %s, current %s); start a new run instead of resuming this one" % (
+                issue_number, str(meta.get("fingerprint", ""))[:12], meta.get("recorded_at", "unknown"), fingerprint[:12]))
+    else:
+        branch = "oneshot/issue-%d" % issue_number
+        if run(["git", "ls-remote", "--heads", "origin", "refs/heads/%s" % branch], check=False):
+            if meta is None:
+                sys.exit("branch %s exists for issue #%d but no fingerprint is recorded at %s; cannot verify the branch matches the current issue (delete the branch and its pull request to regenerate)" % (
+                    branch, issue_number, meta_branch(issue_number)))
+            if meta.get("fingerprint") != fingerprint:
+                sys.exit("issue #%d changed after branch %s was published (fingerprint %s recorded %s, current %s); delete the branch and its pull request to regenerate" % (
+                    issue_number, branch, str(meta.get("fingerprint", ""))[:12], meta.get("recorded_at", "unknown"), fingerprint[:12]))
+
     if state is None:
         missing = [l for l in (READY_LABEL, TYPE_LABEL) if l not in labels]
         if missing:
             sys.exit("issue #%d is not labelled %s (labels: %s); only correctly labelled oneshots may run" % (
                 issue_number, " + ".join(missing), ", ".join(sorted(labels)) or "(none)"))
+        if meta is None or meta.get("fingerprint") != fingerprint:
+            record_fingerprint(issue_number, fingerprint, meta_sha)
         state = {
             "issue": issue_number,
             "issue_title": title,
@@ -180,8 +262,8 @@ def prepare(argv):
     write_issue_file(issue, owner, repo, labels)
     save_state(state)
 
-    print("oneshot prepare: issue=#%d trunk=%s baseline=%s" % (
-        issue_number, state["trunk"], state["baseline_sha"][:12]), file=sys.stderr)
+    print("oneshot prepare: issue=#%d trunk=%s baseline=%s fingerprint=%s" % (
+        issue_number, state["trunk"], state["baseline_sha"][:12], fingerprint[:12]), file=sys.stderr)
     print(json.dumps({"context_updates": {
         "issue_number": str(issue_number),
         "issue_title": title,
