@@ -36,7 +36,7 @@ script = '''
 set -eu
 mkdir -p .git/kiro-spec-scripts
 cat > .git/kiro-spec-scripts/tools.py <<'KIRO_SPEC_TOOLS_PY'
-import datetime, json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
+import datetime, hashlib, json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
 
 DOCS = ["brief", "requirements", "design", "tasks"]
 STATE_PATH = ".git/kiro-spec-state.json"
@@ -114,6 +114,66 @@ def slugify(text):
     return s.strip("-")[:48].strip("-")
 
 
+def issue_fingerprint(title, body):
+    canonical = json.dumps({"title": title, "body": body or ""}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def meta_branch(spec):
+    return "kiro-spec-meta/%s" % spec
+
+
+def load_meta(spec):
+    ref = "refs/heads/%s" % meta_branch(spec)
+    out = run(["git", "ls-remote", "--heads", "origin", ref], check=False)
+    sha = None
+    for line in out.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[1] == ref:
+            sha = parts[0]
+    if sha is None:
+        return None, None
+    run(["git", "fetch", "--quiet", "origin", ref])
+    raw = run(["git", "show", "FETCH_HEAD:fingerprint.json"], check=False)
+    try:
+        meta = json.loads(raw)
+    except ValueError:
+        meta = None
+    if not isinstance(meta, dict) or not isinstance(meta.get("fingerprint"), str) or not meta["fingerprint"]:
+        sys.exit("fingerprint branch %s is unreadable; delete it and the stack branches (or pass -I spec=<new-name>) and re-dispatch" % meta_branch(spec))
+    return meta, sha
+
+
+def record_fingerprint(spec, issue_number, fingerprint, meta_sha):
+    ref = "refs/heads/%s" % meta_branch(spec)
+    path = os.path.join(".git", "kiro-spec-fingerprint.json")
+    with open(path, "w") as f:
+        json.dump({
+            "fingerprint": fingerprint,
+            "issue": issue_number,
+            "spec": spec,
+            "recorded_at": now_iso(),
+        }, f, indent=2, sort_keys=True)
+        f.write("\n")
+    blob = run(["git", "hash-object", "-w", path])
+    os.remove(path)
+
+    index = os.path.join(".git", "kiro-spec-meta-index")
+    if os.path.exists(index):
+        os.remove(index)
+    env = dict(os.environ, GIT_INDEX_FILE=index)
+    run(["git", "update-index", "--add", "--cacheinfo", "100644", blob, "fingerprint.json"], env=env)
+    tree = run(["git", "write-tree"], env=env)
+    os.remove(index)
+
+    ident = []
+    if not run(["git", "config", "user.email"], check=False):
+        ident = ["-c", "user.name=Fabro", "-c", "user.email=noreply@fabro.sh"]
+    tip = run(["git"] + ident + ["commit-tree", tree, "-m", "kiro-spec(%s): record issue fingerprint" % spec])
+    run(["git", "push", "--quiet", "--force-with-lease=%s:%s" % (ref, meta_sha or ""), "origin", "%s:%s" % (tip, ref)])
+    print("kiro-spec prepare: recorded issue fingerprint %s at %s (%s)" % (fingerprint[:12], ref, tip[:12]), file=sys.stderr)
+
+
 def prepare(argv):
     args = list(argv) + [""] * (4 - len(argv))
     issue_in, spec_in, base_in, trunk_in = args[0], args[1], args[2], args[3]
@@ -151,6 +211,9 @@ def prepare(argv):
         f.write("- Labels: %s\n" % labels)
         f.write("- Repository: %s/%s\n\n" % (owner, repo))
         f.write("## Body\n\n%s\n" % (issue.get("body") or "(empty)"))
+
+    fingerprint = issue_fingerprint(title, issue.get("body"))
+    meta, meta_sha = load_meta(spec)
 
     state = None
     if os.path.exists(STATE_PATH):
@@ -207,6 +270,14 @@ def prepare(argv):
             sys.exit("stack branches for %s are not a contiguous 1..4 sequence: %s (delete the stray branches or pass -I spec=<new-name>)" % (
                 spec, [(l.get("layer"), l.get("doc")) for l in layers]))
 
+    if layers:
+        if meta is None:
+            sys.exit("stack branches exist for spec %s but no fingerprint is recorded at %s; cannot verify they match issue #%d (delete the stack branches to regenerate, or pass -I spec=<new-name>)" % (
+                spec, meta_branch(spec), issue_number))
+        if meta.get("fingerprint") != fingerprint:
+            sys.exit("issue #%d changed after the spec was generated (fingerprint %s recorded %s, current %s); delete the stack branches to regenerate, or pass -I spec=<new-name>" % (
+                issue_number, str(meta.get("fingerprint", ""))[:12], meta.get("recorded_at", "unknown"), fingerprint[:12]))
+
     if not os.path.isdir(".kiro"):
         sys.exit("the repository has no .kiro directory; kiro-spec requires a Kiro-enabled repository")
 
@@ -216,6 +287,8 @@ def prepare(argv):
         print("kiro-spec prepare: %s already exists on %s; nothing to do (pass -I spec=<new-name> to force a different spec name)" % (
             spec_dir, state["stack_base"]), file=sys.stderr)
     else:
+        if meta is None or meta.get("fingerprint") != fingerprint:
+            record_fingerprint(spec, issue_number, fingerprint, meta_sha)
         locked = set(l["doc"] for l in layers)
         for doc in DOCS:
             if doc not in locked:
@@ -225,8 +298,8 @@ def prepare(argv):
 
     state["current"] = None
     save_state(state)
-    print("kiro-spec prepare: issue=#%d spec=%s trunk=%s stack_base=%s locked=%d next=%s" % (
-        issue_number, spec, state["trunk"], state["stack_base"], len(layers), next_doc), file=sys.stderr)
+    print("kiro-spec prepare: issue=#%d spec=%s trunk=%s stack_base=%s locked=%d next=%s fingerprint=%s" % (
+        issue_number, spec, state["trunk"], state["stack_base"], len(layers), next_doc, fingerprint[:12]), file=sys.stderr)
     print(json.dumps({"context_updates": {
         "next_doc": next_doc,
         "spec_name": spec,
