@@ -44,6 +44,15 @@ digraph Oneshot {
         max_visits=5
     ]
 
+    rework [
+        label="Queue rework",
+        shape=parallelogram,
+        output_schema="routing",
+        max_visits=3,
+        stdin_source="context.rework_round",
+        script="set -eu\nROUND=$(cat 2>/dev/null | tr -d '[:space:]' || true)\ncase \"$ROUND\" in ''|*[!0-9]*) ROUND=0 ;; esac\nROUND=$((ROUND + 1))\nif [ \"$ROUND\" -gt 2 ]; then\n  printf '{\"outcome\":\"succeeded\",\"context_updates\":{\"rework_round\":\"%s\",\"stage_failure\":\"Review rejected the change after 2 rework rounds; giving up.\"}}\\n' \"$ROUND\"\nelse\n  printf '{\"outcome\":\"succeeded\",\"context_updates\":{\"rework_round\":\"%s\"}}\\n' \"$ROUND\"\nfi"
+    ]
+
     publish [
         label="Publish pull request",
         shape=parallelogram,
@@ -74,8 +83,11 @@ digraph Oneshot {
     simplify -> fail
 
     review -> publish [condition="outcome=succeeded && context.verdict=APPROVED"]
-    review -> implement [condition="outcome=failed && context.verdict=REJECTED && context.internal.node_visit_count < 3"]
+    review -> rework [condition="outcome=failed && context.verdict=REJECTED"]
     review -> fail
+
+    rework -> implement [condition="outcome=succeeded && context.rework_round <= 2"]
+    rework -> fail
 
     publish -> exit
     fail -> exit
