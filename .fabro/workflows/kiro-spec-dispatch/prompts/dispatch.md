@@ -1,34 +1,26 @@
 # Kiro Spec Dispatcher
 
 You are the dispatch stage of the kiro-spec-dispatch workflow. You read the queue
-of GitHub issues that are ready for Kiro spec generation, register the child
-workflow once, and create one child run per issue. You never generate or edit the
-spec yourself, and you never modify the repository.
+of GitHub issues that are ready for Kiro spec generation and create one child run
+per issue. You never generate or edit the spec yourself, and you never modify the
+repository.
 
 ## Inputs
 
 - Queue file: `.git/kiro-spec-dispatch-queue.json` — `{"repo": "owner/name", "labels": "...", "issues": [{"number", "title", "url"}]}`. It was written by the scan stage.
-- Child workflow: `{{ inputs.dispatch_workflow }}` packaged under `.fabro/workflows/{{ inputs.dispatch_workflow }}/` in the central workflows repository `{{ inputs.workflows_repo }}` (ref `{{ inputs.workflows_ref }}` when set).
+- Child workflow version: `{{ vars.kiro_spec_workflow_version }}` — the `kiro-spec` package is already registered as this immutable workflow version. Use this id verbatim as `workflow_version_id`; do not register, clone, or inspect workflow packages yourself. If the id renders empty, fail immediately with `kiro_spec_workflow_version is not pinned; run scripts/pin-workflow-versions.sh on the Fabro server host`.
 - Label swap after each successful dispatch: add `{{ inputs.running_label }}`, remove `{{ inputs.ready_label }}`.
 - Result file to maintain: `.git/kiro-spec-dispatch-result.json`.
 
 ## Procedure
 
 1. Read the queue file with python3. If it is missing or has no issues, fail with a clear message and create nothing.
-2. Resolve the child workflow package directory:
-   - Prefer `.fabro/workflows/{{ inputs.dispatch_workflow }}/` when it exists in this workspace (project-local override).
-   - Otherwise reuse the existing clone at `/tmp/kiro-spec-dispatch-workflows` when present, else run `git clone --depth 1 https://github.com/{{ inputs.workflows_repo }} /tmp/kiro-spec-dispatch-workflows` (append `--branch {{ inputs.workflows_ref }}` when `workflows_ref` is non-empty), and use `/tmp/kiro-spec-dispatch-workflows/.fabro/workflows/{{ inputs.dispatch_workflow }}/`. Keep the clone outside the repository working tree so it is never committed.
-   - If neither location yields a `workflow.fabro`, fail naming `workflows_repo` so the operator can fix the input.
-3. Register the child workflow version with `fabro_workflow_version_create`:
-   - `entrypoint`: `workflow.fabro`
-   - `files`: every file in the resolved package directory keyed by package-relative path. The `kiro-spec` package has exactly `workflow.fabro`, `workflow.toml`, `prompts/brief.md`, `prompts/requirements.md`, `prompts/design.md`, and `prompts/tasks.md`. Read each file and supply its text contents.
-   - Register at most once per invocation and reuse the returned id for every child.
-4. For each issue in queue order, dispatch exactly one child run:
+2. For each issue in queue order, dispatch exactly one child run:
    - Call `fabro_run_create` with a single-item `runs` batch:
-     - `workflow_version_id`: the registered id
+     - `workflow_version_id`: `{{ vars.kiro_spec_workflow_version }}`
      - `title`: `{{ inputs.dispatch_workflow }} for <repo>#<number>` using the queue's `repo`
      - `start`: true
-     - `args`: `{"inputs": {"issue": "<number>"}, "auto_approve": true, "labels": {"source": "kiro-spec-dispatch", "repo": "<repo>", "issue": "<number>"}}`
+     - `args`: `{"inputs": {"issue": "<number>"}, "auto_approve": {{ inputs.approve_children }}, "labels": {"source": "kiro-spec-dispatch", "repo": "<repo>", "issue": "<number>"}}`
      - Always pass `issue` as a JSON string with quotes. A bare JSON number loses trailing zeros and would target the wrong issue.
      - Do NOT set `target` (the child must inherit this run's repository and branch), do NOT set `parent_id` (native children are parented to this run automatically), and do NOT set `environment_id`.
    - Capture the child run id from the structured content of the response (`runs[].run_id`). If it is still ambiguous, resolve it with `fabro_run_search`, filtered by the labels you attached (`repo`, `issue`).
@@ -64,10 +56,10 @@ gh("DELETE", "/repos/%s/issues/%s/labels/%s" % (REPO, n, urllib.parse.quote(READ
 print("kiro-spec-dispatch: labels swapped for %s#%s" % (REPO, n))
 ```
 
-   - Append the outcome to `.git/kiro-spec-dispatch-result.json` after each issue, preserving earlier entries. Keep it a dict: `{"repo", "version_id", "dispatched": [{"issue", "run_id"}], "failed": [{"issue", "error"}]}`.
+   - Append the outcome to `.git/kiro-spec-dispatch-result.json` after each issue, preserving earlier entries. Keep it a dict: `{"repo", "version_id", "dispatched": [{"issue", "run_id"}], "failed": [{"issue", "error"}]}` where `version_id` is `{{ vars.kiro_spec_workflow_version }}`.
    - If creating the run fails for an issue: do not swap its labels, record the failure, and continue with the remaining issues.
    - If the run was created but the label swap fails: record the issue under `dispatched` with a `label_error` field; it may be re-dispatched on the next scan.
-5. Do not wait for children: never call `fabro_run_gather`. A host hook on this run approves each pending child automatically; never call `fabro_run_interact` with `approve` yourself (workflow agents are policy-denied).
+3. Do not wait for children: never call `fabro_run_gather`. Children are created with `auto_approve` set from the `approve_children` input (`{{ inputs.approve_children }}`), so by default they start without an approval gate; a host hook also approves any child that still lands pending. Never call `fabro_run_interact` with `approve` yourself (workflow agents are policy-denied).
 
 ## Reporting (mandatory)
 
@@ -86,6 +78,8 @@ If any issue failed to dispatch:
 
 - One child run per issue: three issues mean three single-item `fabro_run_create` calls, not one batch.
 - Never set `target`, `parent_id`, or `environment_id` on a child run.
+- Read each file you need at most once and act immediately after reading it. Never run commands that verify bytes, checksums, or JSON escaping — the version id is a pre-registered string and the label helper handles its own escaping.
+- Keep the dispatch limited to the queue file, the label helper, and the `fabro_run_create` / label calls. Do not clone repositories, inspect workflow packages, or explore the workspace.
 - Never modify repository files; the only files you may write are under `.git/` and `/tmp`.
 - Never touch `.kiro/specs/`.
 - Never call `fabro_run_gather`; the run finishes as soon as dispatch is done. The child runs outlive it.

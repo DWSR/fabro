@@ -10,33 +10,26 @@ yourself.
 
 - Spec: `{{ inputs.spec }}`
 - Loop state file: `.git/kiro-impl-state.json` (JSON). This iteration's task is in `current` with `task`, `text`, `layer`, and `branch`.
-- Central workflow repository: `{{ inputs.workflows_repo }}` (ref `{{ inputs.workflows_ref }}` when set), hosting the `kiro-task` package under `.fabro/workflows/kiro-task/`.
+- Child workflow version: `{{ vars.kiro_task_workflow_version }}` — the `kiro-task` package is already registered as this immutable workflow version. Use this id verbatim as `workflow_version_id`; do not register, clone, or inspect workflow packages yourself. If the id renders empty, fail immediately with `kiro_task_workflow_version is not pinned; run scripts/pin-workflow-versions.sh on the Fabro server host`.
 
 ## Procedure
 
 1. Read the state file with python3. If `current` is missing, fail with a clear message and do not create anything.
-2. Resolve the child workflow package directory:
-   - Prefer `.fabro/workflows/kiro-task/` when it exists in this workspace (project-local override).
-   - Otherwise use the central workflow repository: reuse the existing clone at `/tmp/kiro-impl-workflows` when present, else run `git clone --depth 1 https://github.com/{{ inputs.workflows_repo }} /tmp/kiro-impl-workflows` (append `--branch {{ inputs.workflows_ref }}` when `workflows_ref` is non-empty), and use `/tmp/kiro-impl-workflows/.fabro/workflows/kiro-task/`. Keep the clone outside the repository working tree so it is never committed.
-   - If `workflows_repo` is empty and the workspace has no package, fail immediately with that reason. If a clone or workspace lookup yields no `workflow.fabro`, fail naming `workflows_repo` so the operator can fix the input.
-3. Resolve the child workflow version:
-   - If the state file already has `child_workflow_version_id`, reuse it and skip registration.
-   - Otherwise read every file in the resolved package directory and call `fabro_workflow_version_create` with entrypoint `workflow.fabro` and a `files` map of package-relative paths to file contents: `workflow.fabro`, `workflow.toml`, `prompts/implement.md`, `prompts/review.md`, `prompts/blocked.md`. The call returns the registered version id as text (for example "Registered workflow version <64-hex-id>"). Store that id in the state file as `child_workflow_version_id`, and when the package came from a clone also store `child_workflow_source` = `{"repo": "{{ inputs.workflows_repo }}", "ref": "{{ inputs.workflows_ref }}", "sha": "<git -C /tmp/kiro-impl-workflows rev-parse HEAD>"}`. Preserve all other state keys.
-4. Create the child run with `fabro_run_create`, one single-item `runs` batch:
-   - `workflow_version_id`: the resolved version id
+2. Create the child run with `fabro_run_create`, one single-item `runs` batch:
+   - `workflow_version_id`: `{{ vars.kiro_task_workflow_version }}`
    - `title`: `{{ inputs.spec }} task <task>`
    - `start`: true
-   - `args`: `{"inputs": {"spec": "{{ inputs.spec }}", "task": "<task>"}, "auto_approve": true, "labels": {"kiro-spec": "{{ inputs.spec }}", "kiro-task": "<task>"}}`
+   - `args`: `{"inputs": {"spec": "{{ inputs.spec }}", "task": "<task>"}, "auto_approve": {{ inputs.approve_children }}, "labels": {"kiro-spec": "{{ inputs.spec }}", "kiro-task": "<task>"}}`
    - Always pass `task` as a JSON string with quotes. A bare JSON number loses trailing zeros (`1.10` becomes `1.1` and would implement the wrong task).
    - Do NOT set `target` (the child must inherit this run's repository and current execution branch) and do NOT set `parent_id` (native children are parented to this run automatically).
    - If `current.child_run_id` is already set, skip this step and reuse that child: it means a previous dispatch already created the run.
-5. Capture the child run id from the create response. The structured content of the response carries `runs[].run_id` even when the text summary only says how many runs were created. If the id is still ambiguous, resolve it with `fabro_run_search`, filtered by the labels you attached (`kiro-spec`, `kiro-task`). Write it into the state file as `current.child_run_id` immediately, before waiting.
-6. Wait for the child with `fabro_run_gather`: `{"run_ids": ["<child id>"], "timeout_seconds": 1800}`. If the child is still live (`submitted`, `pending`, `runnable`, or `running`), call gather again and keep waiting. `succeeded` is success; every other terminal state (`failed`, `dead`, `canceled`, `cancelled`) is failure.
-   - Parent-generated children can sit `pending` with an approval requirement. {% if inputs.approve_children == 'true' %}A host hook on this run approves each pending child automatically as soon as it appears; never call `fabro_run_interact` with `approve` yourself (workflow agents are policy-denied) — just keep waiting.{% else %}Keep polling while it is pending; an operator must approve it from the Fabro web UI or with `fabro approve <run id>`. Never approve it yourself in this mode.{% endif %}
-7. On failure, read the child's final events with `fabro_run_events` and derive a one-line reason (which stage failed and why).
-8. Update the state file with python3, preserving all other keys:
-   - success: `current.child_run_id` and `current.status = "succeeded"`
-   - failure: `current.child_run_id`, `current.status = "failed"`, `current.failure = "<one-line reason>"`
+3. Capture the child run id from the create response. The structured content of the response carries `runs[].run_id` even when the text summary only says how many runs were created. If the id is still ambiguous, resolve it with `fabro_run_search`, filtered by the labels you attached (`kiro-spec`, `kiro-task`). Write it into the state file as `current.child_run_id` immediately, before waiting.
+4. Wait for the child with `fabro_run_gather`: `{"run_ids": ["<child id>"], "timeout_seconds": 1800}`. If the child is still live (`submitted`, `pending`, `runnable`, or `running`), call gather again and keep waiting. `succeeded` is success; every other terminal state (`failed`, `dead`, `canceled`, `cancelled`) is failure.
+   - Parent-generated children can sit `pending` with an approval requirement. {% if inputs.approve_children == 'true' %}Children are created pre-approved (`auto_approve` follows the `approve_children` input), so they start without an approval gate; a host hook also approves any child that still lands pending. Never call `fabro_run_interact` with `approve` yourself (workflow agents are policy-denied) — just keep waiting.{% else %}Keep polling while it is pending; an operator must approve it from the Fabro web UI or with `fabro approve <run id>`. Never approve it yourself in this mode.{% endif %}
+5. On failure, read the child's final events with `fabro_run_events` and derive a one-line reason (which stage failed and why).
+6. Update the state file with python3, preserving all other keys:
+   - success: `current.child_run_id`, `current.child_workflow_version_id` = `{{ vars.kiro_task_workflow_version }}`, `current.status = "succeeded"`
+   - failure: `current.child_run_id`, `current.child_workflow_version_id` = `{{ vars.kiro_task_workflow_version }}`, `current.status = "failed"`, `current.failure = "<one-line reason>"`
 
 ## Reporting (mandatory)
 
@@ -47,7 +40,7 @@ Success:
 
 {"outcome": "succeeded", "context_updates": {"dispatch_result": "success", "dispatch_task": "<task>", "dispatch_child_run_id": "<child id>"}}
 
-Failure (including step 1-3 failures):
+Failure (including step 1-2 failures):
 
 {"outcome": "failed", "failure_reason": "<one line>", "context_updates": {"dispatch_result": "failed", "dispatch_failure": "task <task>: <what failed and the one-line reason>"}}
 
@@ -55,6 +48,8 @@ Failure (including step 1-3 failures):
 
 - One task and one child run per invocation.
 - Never modify repository files, and never touch the Kiro spec; the only file you may edit is `.git/kiro-impl-state.json`, always through python3.
+- Read each file you need at most once and act immediately after reading it. Never run commands that verify bytes, checksums, or JSON escaping — the version id is a pre-registered string.
+- Keep the dispatch limited to the state file and the `fabro_run_create` / `fabro_run_gather` calls. Do not clone repositories, inspect workflow packages, or explore the workspace.
 - Never mark the task complete yourself and never edit `.kiro/specs/`.
 - Never set `target` or `parent_id` on the child.
 - Do not stop while the child is live; keep polling `fabro_run_gather`.
