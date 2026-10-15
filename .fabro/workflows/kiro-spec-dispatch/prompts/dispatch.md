@@ -44,9 +44,10 @@ READY = "{{ inputs.ready_label }}"
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
 if not TOKEN:
     sys.exit("GITHUB_TOKEN is not set")
+BASE = os.environ.get("KIRO_SPEC_DISPATCH_API_BASE", "https://api.github.com").rstrip("/")
 
 def gh(method, path, body=None):
-    req = urllib.request.Request("https://api.github.com" + path, method=method, headers={
+    req = urllib.request.Request(BASE + path, method=method, headers={
         "Authorization": "Bearer %s" % TOKEN,
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2026-03-10",
