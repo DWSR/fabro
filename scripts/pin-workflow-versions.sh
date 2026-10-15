@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Pin child workflow versions for the dispatch workflows.
 #
-# kiro-spec-dispatch, kiro-impl, and oneshot-dispatch children (kiro-spec,
-# kiro-task, oneshot) whose packages used to be re-emitted inline by the agent
+# The dispatch and kiro-impl dispatchers create children (kiro-spec,
+# kiro-task, oneshot) whose packages used to be re-emitted inline by an agent
 # through fabro_workflow_version_create (a ~40 KiB JSON-escaping task that has
 # caused multi-minute agent stalls). The dispatchers now read a pre-registered,
 # immutable version id from a server-owned variable instead.
@@ -13,7 +13,7 @@
 # Re-run it after changing anything under .fabro/workflows/kiro-spec/,
 # .fabro/workflows/kiro-task/, or .fabro/workflows/oneshot/, then re-register
 # the dispatcher packages themselves (fabro run/whatever trigger) so the new
-# prompt takes effect. Registration is content-addressed: unchanged packages
+# scripts take effect. Registration is content-addressed: unchanged packages
 # pin the same id.
 set -euo pipefail
 
