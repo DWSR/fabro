@@ -1,6 +1,6 @@
 digraph KiroImpl {
     graph [
-        goal="Implement every task of Kiro spec {{ inputs.spec }} in series: dispatch the kiro-task workflow once per task, integrate each result, and publish a GitHub-native PR stack with one pull request per task.",
+        goal="Implement every task of Kiro spec {{ inputs.spec }} in series: dispatch the kiro-task workflow once per task through the Fabro API bridge, integrate each result, and publish a GitHub-native PR stack with one pull request per task.",
     ]
     rankdir=LR
 
@@ -28,7 +28,16 @@ digraph KiroImpl {
 
     dispatch [
         label="Dispatch task run",
-        prompt="@prompts/dispatch.md",
+        shape=parallelogram,
+        language="python",
+        output_schema="routing",
+        max_visits=200,
+        script="import json, os, re, subprocess, sys, urllib.error, urllib.request\n\nSTATE_PATH = \".git/kiro-impl-state.json\"\nAPI_BASE = os.environ.get(\"KIRO_IMPL_API_BASE\", \"http://host.docker.internal:32276/api/v1\").rstrip(\"/\")\nWORKFLOW_VERSION = {{ vars.kiro_task_workflow_version }}\n\n\ndef run(cmd, check=True):\n    r = subprocess.run(cmd, capture_output=True, text=True)\n    if check and r.returncode != 0:\n        sys.exit(\"command failed: %s\\n%s\" % (\" \".join(cmd), r.stderr.strip()))\n    return r.stdout.strip()\n\n\ndef api(method, path, body=None):\n    data = json.dumps(body).encode() if body is not None else None\n    req = urllib.request.Request(API_BASE + path, method=method, data=data, headers={\n        \"Accept\": \"application/json\",\n        \"Content-Type\": \"application/json\",\n        \"User-Agent\": \"fabro-kiro-impl-workflow\",\n    })\n    try:\n        with urllib.request.urlopen(req, timeout=120) as r:\n            raw = r.read()\n            return r.status, (json.loads(raw) if raw else None)\n    except urllib.error.HTTPError as e:\n        return e.code, e.read().decode(\"utf-8\", \"replace\")[:500]\n    except urllib.error.URLError as e:\n        sys.exit(\"Fabro API bridge at %s is unreachable: %s (is fabro-api-bridge deployed and is this workflow allowed to dispatch?)\" % (API_BASE, e.reason))\n\n\ndef origin_repo():\n    url = run([\"git\", \"config\", \"--get\", \"remote.origin.url\"])\n    m = re.match(r\"(?:https://github\\.com/|git@github\\.com:)([^/]+)/([^/]+?)(?:\\.git)?/?$\", url)\n    if not m:\n        sys.exit(\"cannot derive owner/repo from origin url %r\" % url)\n    return \"%s/%s\" % (m.group(1), m.group(2))\n\n\nif not WORKFLOW_VERSION.strip():\n    sys.exit(\"kiro_task_workflow_version is not pinned; run scripts/pin-workflow-versions.sh on the Fabro server host\")\n\nstate = json.load(open(STATE_PATH))\ncur = state.get(\"current\")\nif not cur or not cur.get(\"task\"):\n    sys.exit(\"no current task in %s; pick must run first\" % STATE_PATH)\n\nspec = state[\"spec\"]\ntask = cur[\"task\"]\nbranch = run([\"git\", \"rev-parse\", \"--abbrev-ref\", \"HEAD\"])\nif not branch or branch == \"HEAD\":\n    sys.exit(\"workspace is not on a branch; cannot derive the dispatch target\")\n\nchild = cur.get(\"child_run_id\")\nif not child:\n    status, created = api(\"POST\", \"/runs\", {\n        \"workflow_version_id\": WORKFLOW_VERSION,\n        \"title\": \"%s task %s\" % (spec, task),\n        \"target\": {\"kind\": \"git\", \"repo\": origin_repo(), \"branch\": branch},\n        \"args\": {\n            \"inputs\": {\"spec\": spec, \"task\": task},\n            \"auto_approve\": True,\n            \"labels\": {\"kiro-spec\": spec, \"kiro-task\": task},\n        },\n    })\n    if not isinstance(status, int) or not (200 <= status < 300):\n        sys.exit(\"run create failed: HTTP %s: %s\" % (status, created))\n    child = (created or {}).get(\"id\") or (created or {}).get(\"run_id\")\n    if not child:\n        sys.exit(\"run create returned no run id: %r\" % created)\n    cur[\"child_run_id\"] = child\n    cur[\"child_workflow_version_id\"] = WORKFLOW_VERSION\n    json.dump(state, open(STATE_PATH, \"w\"), indent=1, sort_keys=True)\n    print(\"kiro-impl dispatch: created child run %s for task %s\" % (child, task), file=sys.stderr)\nelse:\n    print(\"kiro-impl dispatch: reusing recorded child run %s for task %s\" % (child, task), file=sys.stderr)\n\nstatus, started = api(\"POST\", \"/runs/%s/start\" % child, {})\nif status != 409 and not (isinstance(status, int) and 200 <= status < 300):\n    sys.exit(\"start of child run %s failed: HTTP %s: %s\" % (child, status, started))\n\nprint(\"kiro-impl dispatch: task=%s layer=%s child=%s start=HTTP %s\" % (task, cur.get(\"layer\"), child, status), file=sys.stderr)\nprint(json.dumps({\"context_updates\": {\n    \"dispatch_result\": \"success\",\n    \"dispatch_task\": task,\n    \"dispatch_child_run_id\": child,\n}}))"
+    ]
+
+    await [
+        label="Await task run",
+        prompt="@prompts/await.md",
         output_schema="routing",
         max_visits=200
     ]
@@ -66,8 +75,11 @@ digraph KiroImpl {
     pick -> publish [condition="outcome=succeeded && context.has_pending=false"]
     pick -> fail
 
-    dispatch -> integrate [condition="outcome=succeeded && context.dispatch_result=success"]
+    dispatch -> await [condition="outcome=succeeded"]
     dispatch -> fail
+
+    await -> integrate [condition="outcome=succeeded && context.dispatch_result=success"]
+    await -> fail
 
     integrate -> pick [condition="outcome=succeeded && context.has_pending=true"]
     integrate -> publish [condition="outcome=succeeded && context.has_pending=false"]
