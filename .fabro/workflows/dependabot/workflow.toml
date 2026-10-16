@@ -12,8 +12,9 @@ pr = ""
 depth = 0
 
 # contents: write - fetch and force-push the PR branch; pull_requests: write - enable
-# auto-merge via GraphQL or merge directly via REST when the base branch is
-# unprotected; issues: write - swap the fabro-running dispatch label.
+# auto-merge via GraphQL or merge directly via REST when auto-merge cannot be
+# enabled (unprotected branch, or already mergeable); issues: write - swap the
+# fabro-running dispatch label.
 [run.integrations.github]
 permissions = { contents = "write", pull_requests = "write", issues = "write" }
 
@@ -281,9 +282,17 @@ def amend(argv):
     }}))
 
 
-def unprotected_branch_error(errors):
+AUTO_MERGE_NOT_APPLICABLE = (
+    "Protected branch rules not configured",
+    "Pull request is in clean status",
+    "Pull request is in unstable status",
+)
+
+
+def auto_merge_not_applicable(errors):
     for err in errors or []:
-        if "Protected branch rules not configured" in (err.get("message") or ""):
+        message = err.get("message") or ""
+        if any(needle in message for needle in AUTO_MERGE_NOT_APPLICABLE):
             return True
     return False
 
@@ -322,11 +331,12 @@ def merge(argv):
         query = 'mutation { enablePullRequestAutoMerge(input: {pullRequestId: "%s", mergeMethod: REBASE}) { pullRequest { autoMergeRequest { enabledAt mergeMethod } } } }' % node_id
         status, body = graphql(query)
         errors = (body or {}).get("errors")
-        if unprotected_branch_error(errors):
-            # GitHub only allows enabling auto-merge when the base branch has
-            # protection rules. Without any, nothing gates the merge, so merge
+        if auto_merge_not_applicable(errors):
+            # GitHub refuses to enable auto-merge when there is nothing for it
+            # to wait on: no protection rules on the base branch, or the pull
+            # request is already in a mergeable clean/unstable state. Merge
             # immediately with the same rebase strategy instead.
-            print("dependabot merge: %s has no protected branch rules; merging directly with rebase" % (
+            print("dependabot merge: auto-merge is not applicable to %s; merging directly with rebase" % (
                 url or ("#%d" % number)), file=sys.stderr)
             merge_directly(owner, repo, number, url)
             result = "merged"

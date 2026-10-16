@@ -1,6 +1,6 @@
 digraph Dependabot {
     graph [
-        goal="Keep dependabot pull request {{ inputs.pr }} mergeable: rebase it onto the latest base branch, verify the repository's tests pass (fixing regressions and re-running until they pass when they do not), amend every change into the pull request's single commit, push, and land it with a rebase merge: enable GitHub auto-merge, or merge directly when the base branch has no protected branch rules so auto-merge cannot be enabled.",
+        goal="Keep dependabot pull request {{ inputs.pr }} mergeable: rebase it onto the latest base branch, verify the repository's tests pass (fixing regressions and re-running until they pass when they do not), amend every change into the pull request's single commit, push, and land it with a rebase merge: enable GitHub auto-merge, or merge directly when auto-merge cannot be enabled (no protected branch rules, or the pull request is already immediately mergeable).",
     ]
     rankdir=LR
 
