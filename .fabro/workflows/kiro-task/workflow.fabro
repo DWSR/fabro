@@ -28,7 +28,10 @@ digraph KiroTask {
         prompt="@prompts/review.md",
         output_schema="routing",
         goal_gate=true,
-        max_visits=5
+        max_visits=5,
+        model="gpt-6-luna",
+        provider="litellm",
+        reasoning_effort="xhigh"
     ]
 
     rework [
