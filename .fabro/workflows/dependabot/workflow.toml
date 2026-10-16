@@ -12,7 +12,8 @@ pr = ""
 depth = 0
 
 # contents: write - fetch and force-push the PR branch; pull_requests: write - enable
-# auto-merge via GraphQL; issues: write - swap the fabro-running dispatch label.
+# auto-merge via GraphQL or merge directly via REST when the base branch is
+# unprotected; issues: write - swap the fabro-running dispatch label.
 [run.integrations.github]
 permissions = { contents = "write", pull_requests = "write", issues = "write" }
 
@@ -30,7 +31,7 @@ script = '''
 set -eu
 mkdir -p .git/dependabot-scripts
 cat > .git/dependabot-scripts/tools.py <<'DEPENDABOT_TOOLS_PY'
-import datetime, json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
+import datetime, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 
 RUNNING_LABEL = "fabro-running"
 READY_LABEL = "fabro-ready"
@@ -280,6 +281,28 @@ def amend(argv):
     }}))
 
 
+def unprotected_branch_error(errors):
+    for err in errors or []:
+        if "Protected branch rules not configured" in (err.get("message") or ""):
+            return True
+    return False
+
+
+def merge_directly(owner, repo, number, url):
+    # Mergeability is recomputed asynchronously after the amend stage's push,
+    # so a fresh pull request can briefly report "not mergeable" (HTTP 405).
+    body = None
+    for attempt in range(4):
+        status, body = gh("PUT", "/repos/%s/%s/pulls/%d/merge" % (owner, repo, number),
+                          {"merge_method": "rebase"}, expect=(200, 405, 409))
+        if status == 200 and (body or {}).get("merged"):
+            return
+        if attempt < 3:
+            time.sleep(5)
+    sys.exit("direct rebase merge of %s failed: %s" % (
+        url or ("#%d" % number), json.dumps(body)[:1000]))
+
+
 def merge(argv):
     state = load_state()
     number = state["pr"]
@@ -299,14 +322,23 @@ def merge(argv):
         query = 'mutation { enablePullRequestAutoMerge(input: {pullRequestId: "%s", mergeMethod: REBASE}) { pullRequest { autoMergeRequest { enabledAt mergeMethod } } } }' % node_id
         status, body = graphql(query)
         errors = (body or {}).get("errors")
-        if status >= 300 or errors:
+        if unprotected_branch_error(errors):
+            # GitHub only allows enabling auto-merge when the base branch has
+            # protection rules. Without any, nothing gates the merge, so merge
+            # immediately with the same rebase strategy instead.
+            print("dependabot merge: %s has no protected branch rules; merging directly with rebase" % (
+                url or ("#%d" % number)), file=sys.stderr)
+            merge_directly(owner, repo, number, url)
+            result = "merged"
+        elif status >= 300 or errors:
             sys.exit("enabling auto-merge on %s failed: %s" % (
                 url or ("#%d" % number), json.dumps(errors or body)[:1000]))
-        request = ((((body or {}).get("data") or {}).get("enablePullRequestAutoMerge") or {}).get("pullRequest") or {}).get("autoMergeRequest")
-        if not request:
-            sys.exit("GitHub accepted enablePullRequestAutoMerge for %s but returned no auto-merge request" % (
-                url or ("#%d" % number)))
-        result = "enabled"
+        else:
+            request = ((((body or {}).get("data") or {}).get("enablePullRequestAutoMerge") or {}).get("pullRequest") or {}).get("autoMergeRequest")
+            if not request:
+                sys.exit("GitHub accepted enablePullRequestAutoMerge for %s but returned no auto-merge request" % (
+                    url or ("#%d" % number)))
+            result = "enabled"
     print("dependabot merge: pr=#%d result=%s" % (number, result), file=sys.stderr)
     print(json.dumps({"context_updates": {
         "auto_merge": result,
