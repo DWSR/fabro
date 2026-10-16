@@ -19,14 +19,20 @@ digraph Dependabot {
         label="Verify tests",
         prompt="@prompts/test.md",
         output_schema="routing",
-        max_visits=6
+        max_visits=6,
+        model="gpt-6-luna",
+        provider="litellm",
+        reasoning_effort="xhigh"
     ]
 
     fix [
         label="Fix failures",
         prompt="@prompts/fix.md",
         output_schema="routing",
-        max_visits=5
+        max_visits=5,
+        model="gpt-6-luna",
+        provider="litellm",
+        reasoning_effort="xhigh"
     ]
 
     rework [
