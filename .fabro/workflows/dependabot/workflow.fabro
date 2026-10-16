@@ -29,6 +29,15 @@ digraph Dependabot {
         max_visits=5
     ]
 
+    rework [
+        label="Queue rework",
+        shape=parallelogram,
+        output_schema="routing",
+        max_visits=4,
+        stdin_source="context.fix_round",
+        script="set -eu\nROUND=$(cat 2>/dev/null | tr -d '[:space:]' || true)\ncase \"$ROUND\" in ''|*[!0-9]*) ROUND=0 ;; esac\nROUND=$((ROUND + 1))\nif [ \"$ROUND\" -gt 3 ]; then\n  printf '{\"outcome\":\"succeeded\",\"context_updates\":{\"fix_round\":\"%s\",\"stage_failure\":\"Tests still fail after 3 fix rounds; inspect .git/dependabot-test.log and the run context.\"}}\\n' \"$ROUND\"\nelse\n  printf '{\"outcome\":\"succeeded\",\"context_updates\":{\"fix_round\":\"%s\"}}\\n' \"$ROUND\"\nfi"
+    ]
+
     amend [
         label="Amend and push",
         shape=parallelogram,
@@ -58,8 +67,11 @@ digraph Dependabot {
     prepare -> fail
 
     test -> amend [condition="outcome=succeeded && context.tests_passed=true"]
-    test -> fix [condition="outcome=succeeded && context.tests_passed=false && context.internal.node_visit_count < 5"]
+    test -> rework [condition="outcome=succeeded && context.tests_passed=false"]
     test -> fail
+
+    rework -> fix [condition="outcome=succeeded && context.fix_round <= 3"]
+    rework -> fail
 
     fix -> test [condition="outcome=succeeded"]
     fix -> fail
