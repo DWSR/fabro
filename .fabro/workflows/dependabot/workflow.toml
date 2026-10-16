@@ -1,0 +1,336 @@
+_version = 1
+
+[workflow]
+graph = "workflow.fabro"
+
+[run.inputs]
+pr = ""
+
+# Full history: rebasing the PR branch onto the base branch needs the real merge base
+# across both histories.
+[run.clone]
+depth = 0
+
+# contents: write - fetch and force-push the PR branch; pull_requests: write - enable
+# auto-merge via GraphQL; issues: write - swap the fabro-running dispatch label.
+[run.integrations.github]
+permissions = { contents = "write", pull_requests = "write", issues = "write" }
+
+# Checkpoints MUST stay disabled: Fabro's checkpoint commits run `git add -A` + `git commit`
+# on the current HEAD, which here is the PR branch, and would both violate the single-commit
+# invariant and corrupt the amend target.
+[run.run_branch]
+enabled = false
+
+[run.pull_request]
+enabled = false
+
+[[run.prepare.steps]]
+script = '''
+set -eu
+mkdir -p .git/dependabot-scripts
+cat > .git/dependabot-scripts/tools.py <<'DEPENDABOT_TOOLS_PY'
+import datetime, json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
+
+RUNNING_LABEL = "fabro-running"
+READY_LABEL = "fabro-ready"
+STATE_PATH = ".git/dependabot-state.json"
+PR_PATH = ".git/dependabot-pr.md"
+API_BASE = os.environ.get("DEPENDABOT_API_BASE", "https://api.github.com").rstrip("/")
+GRAPHQL_URL = os.environ.get("DEPENDABOT_GRAPHQL_URL", API_BASE + "/graphql")
+
+
+def run(cmd, check=True, env=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if check and r.returncode != 0:
+        sys.exit("command failed: %s\n%s" % (" ".join(cmd), r.stderr.strip()))
+    return r.stdout.strip()
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def load_state():
+    if not os.path.exists(STATE_PATH):
+        sys.exit("state file %s is missing; the prepare stage must run first" % STATE_PATH)
+    with open(STATE_PATH) as f:
+        return json.load(f)
+
+
+def save_state(state):
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+
+
+def gh(method, path, body=None, expect=(200, 201)):
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        sys.exit("GITHUB_TOKEN is not set; declare [run.integrations.github.permissions] on this workflow")
+    req = urllib.request.Request(API_BASE + path, method=method, headers={
+        "Authorization": "Bearer %s" % token,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2026-03-10",
+        "Content-Type": "application/json",
+        "User-Agent": "fabro-dependabot-workflow",
+    })
+    data = json.dumps(body).encode() if body is not None else None
+    try:
+        with urllib.request.urlopen(req, data=data, timeout=60) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        if e.code in expect:
+            try:
+                return e.code, json.loads(raw)
+            except ValueError:
+                return e.code, raw
+        sys.exit("GitHub API %s %s failed: HTTP %s\n%s" % (method, path, e.code, raw[:1000]))
+
+
+def graphql(query):
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        sys.exit("GITHUB_TOKEN is not set; declare [run.integrations.github.permissions] on this workflow")
+    req = urllib.request.Request(GRAPHQL_URL, method="POST", data=json.dumps({"query": query}).encode(), headers={
+        "Authorization": "Bearer %s" % token,
+        "Content-Type": "application/json",
+        "User-Agent": "fabro-dependabot-workflow",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, {"errors": [{"message": raw[:1000]}]}
+
+
+def origin_repo():
+    url = subprocess.run(["git", "config", "--get", "remote.origin.url"], capture_output=True, text=True).stdout.strip()
+    m = re.match(r"(?:https://github\.com/|git@github\.com:)([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+    if not m:
+        sys.exit("cannot derive owner/repo from origin url %r" % url)
+    return m.group(1), m.group(2)
+
+
+def detect_trunk():
+    head = run(["git", "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], check=False)
+    if head.startswith("origin/"):
+        return head.split("/", 1)[1]
+    out = run(["git", "remote", "show", "origin"], check=False)
+    m = re.search(r"HEAD branch:\s*(\S+)", out)
+    return m.group(1) if m else "main"
+
+
+def parse_pr_ref(value):
+    m = re.search(r"/pull/(\d+)", value or "")
+    if m:
+        return int(m.group(1))
+    if re.match(r"^#?\d+$", (value or "").strip()):
+        return int(value.strip().lstrip("#"))
+    sys.exit("input 'pr' must be a GitHub pull request number (123), #123, or a pull request URL; got %r" % value)
+
+
+def commit_ident():
+    if not run(["git", "config", "user.email"], check=False):
+        return ["-c", "user.name=Fabro", "-c", "user.email=noreply@fabro.sh"]
+    return []
+
+
+def write_pr_file(pr, owner, repo, labels):
+    with open(PR_PATH, "w") as f:
+        f.write("# GitHub pull request #%d: %s\n\n" % (pr["number"], (pr.get("title") or "").strip()))
+        f.write("- URL: %s\n" % pr.get("html_url", ""))
+        f.write("- Author: %s\n" % ((pr.get("user") or {}).get("login", "")))
+        f.write("- State: %s\n" % pr.get("state"))
+        f.write("- Base: %s\n" % ((pr.get("base") or {}).get("ref", "")))
+        f.write("- Head: %s\n" % ((pr.get("head") or {}).get("ref", "")))
+        f.write("- Labels: %s\n" % (", ".join(sorted(labels)) or "(none)"))
+        f.write("- Repository: %s/%s\n\n" % (owner, repo))
+        f.write("## Body\n\n%s\n" % (pr.get("body") or "(empty)"))
+
+
+def label_swap(owner, repo, number, labels):
+    gh("POST", "/repos/%s/%s/issues/%d/labels" % (owner, repo, number), {"labels": [RUNNING_LABEL]})
+    if READY_LABEL in labels:
+        gh("DELETE", "/repos/%s/%s/issues/%d/labels/%s" % (owner, repo, number, urllib.parse.quote(READY_LABEL, safe="")))
+
+
+def squash_to_single(parent, ident):
+    original = run(["git", "rev-parse", "HEAD"])
+    run(["git"] + ident + ["reset", "--soft", parent])
+    run(["git"] + ident + ["commit", "-q", "--no-gpg-sign", "--no-verify", "-C", original])
+    return original
+
+
+def prepare(argv):
+    number = parse_pr_ref(argv[0] if argv else "")
+    owner, repo = origin_repo()
+    slug = "%s/%s" % (owner, repo)
+    run(["git", "fetch", "--prune", "--quiet", "origin"])
+    _, pr = gh("GET", "/repos/%s/%s/pulls/%d" % (owner, repo, number))
+    if pr.get("merged") or pr.get("state") != "open":
+        sys.exit("pull request #%d is %s; refusing to work on a non-open pull request" % (
+            number, "merged" if pr.get("merged") else pr.get("state")))
+    author = (pr.get("user") or {}).get("login", "")
+    if author != "dependabot[bot]":
+        sys.exit("pull request #%d is authored by %r, not dependabot[bot]; this workflow only handles dependabot pull requests" % (
+            number, author))
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    if ((head.get("repo") or {}).get("full_name") or "") != slug:
+        sys.exit("pull request #%d head %r is not in %s; fork pull requests are unsupported" % (
+            number, head.get("label") or head.get("ref") or "?", slug))
+    branch = head.get("ref") or ""
+    if not branch:
+        sys.exit("pull request #%d has no head branch" % number)
+    trunk = base.get("ref") or detect_trunk()
+    labels = [l.get("name") for l in (pr.get("labels") or []) if l.get("name")]
+
+    label_swap(owner, repo, number, labels)
+    write_pr_file(pr, owner, repo, labels)
+
+    ref = "refs/heads/%s" % branch
+    run(["git", "fetch", "--quiet", "origin", "%s:refs/remotes/origin/%s" % (ref, branch)])
+    run(["git", "checkout", "-q", "-B", branch, "origin/%s" % branch])
+
+    state = {
+        "pr": number,
+        "repo": slug,
+        "title": (pr.get("title") or "").strip(),
+        "url": pr.get("html_url", ""),
+        "branch": branch,
+        "trunk": trunk,
+        "original_sha": run(["git", "rev-parse", "HEAD"]),
+        "squashed": False,
+        "rebase_conflict": False,
+        "created_at": now_iso(),
+    }
+    save_state(state)
+
+    ident = commit_ident()
+    count = int(run(["git", "rev-list", "--count", "origin/%s..HEAD" % trunk]))
+    if count > 1:
+        state["original_sha"] = squash_to_single("origin/%s" % trunk, ident)
+        state["squashed"] = True
+        save_state(state)
+
+    rebase = subprocess.run(["git", "rebase", "origin/%s" % trunk], capture_output=True, text=True)
+    if rebase.returncode != 0:
+        if os.path.isdir(".git/rebase-merge") or os.path.isdir(".git/rebase-apply"):
+            state["rebase_conflict"] = True
+            save_state(state)
+            print("dependabot prepare: rebase of %s onto %s hit conflicts; routing to the fix stage" % (
+                branch, trunk), file=sys.stderr)
+        else:
+            sys.exit("git rebase origin/%s failed: %s" % (trunk, (rebase.stderr or rebase.stdout).strip()[:1000]))
+
+    print("dependabot prepare: pr=#%d branch=%s trunk=%s conflict=%s" % (
+        number, branch, trunk, state["rebase_conflict"]), file=sys.stderr)
+    print(json.dumps({"context_updates": {
+        "pr_number": str(number),
+        "pr_branch": branch,
+        "pr_title": state["title"],
+        "trunk": trunk,
+        "rebase_conflict": "true" if state["rebase_conflict"] else "false",
+    }}))
+
+
+def amend(argv):
+    state = load_state()
+    trunk = state.get("trunk")
+    branch = state.get("branch")
+    if not trunk or not branch:
+        sys.exit("state file %s is missing trunk/branch; start a fresh run" % STATE_PATH)
+    if os.path.isdir(".git/rebase-merge") or os.path.isdir(".git/rebase-apply"):
+        sys.exit("a git rebase is still in progress; the fix stage must complete it before the amend stage can push")
+    count = int(run(["git", "rev-list", "--count", "origin/%s..HEAD" % trunk]))
+    if count != 1:
+        sys.exit("branch %s carries %d commits over origin/%s; refusing to push because the pull request must keep exactly one commit" % (
+            branch, count, trunk))
+    ident = commit_ident()
+    run(["git", "add", "-A"])
+    staged = subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 1
+    if staged:
+        run(["git"] + ident + ["commit", "--amend", "--no-edit", "--no-gpg-sign", "--no-verify"])
+    head = run(["git", "rev-parse", "HEAD"])
+    remote = None
+    out = run(["git", "ls-remote", "--heads", "origin", "refs/heads/%s" % branch], check=False)
+    for line in out.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[1] == "refs/heads/%s" % branch:
+            remote = parts[0]
+    pushed = False
+    if remote != head:
+        cmd = ["git", "push", "--quiet"]
+        if remote is not None:
+            cmd.append("--force-with-lease")
+        cmd += ["origin", "HEAD:refs/heads/%s" % branch]
+        run(cmd)
+        pushed = True
+    print("dependabot amend: head=%s amended=%s pushed=%s" % (head[:12], staged, pushed), file=sys.stderr)
+    print(json.dumps({"context_updates": {
+        "head_sha": head,
+        "amended": "true" if staged else "false",
+        "pushed": "true" if pushed else "false",
+    }}))
+
+
+def merge(argv):
+    state = load_state()
+    number = state["pr"]
+    owner, repo = origin_repo()
+    _, pr = gh("GET", "/repos/%s/%s/pulls/%d" % (owner, repo, number))
+    url = pr.get("html_url", "")
+    if pr.get("merged"):
+        result = "already_merged"
+    elif pr.get("state") != "open":
+        result = "closed"
+    elif pr.get("auto_merge"):
+        result = "already_enabled"
+    else:
+        node_id = pr.get("node_id") or ""
+        if not node_id:
+            sys.exit("pull request #%d has no node id; cannot enable auto-merge" % number)
+        query = 'mutation { enablePullRequestAutoMerge(input: {pullRequestId: "%s", mergeMethod: REBASE}) { pullRequest { autoMergeRequest { enabledAt mergeMethod } } } }' % node_id
+        status, body = graphql(query)
+        errors = (body or {}).get("errors")
+        if status >= 300 or errors:
+            sys.exit("enabling auto-merge on %s failed: %s" % (
+                url or ("#%d" % number), json.dumps(errors or body)[:1000]))
+        request = ((((body or {}).get("data") or {}).get("enablePullRequestAutoMerge") or {}).get("pullRequest") or {}).get("autoMergeRequest")
+        if not request:
+            sys.exit("GitHub accepted enablePullRequestAutoMerge for %s but returned no auto-merge request" % (
+                url or ("#%d" % number)))
+        result = "enabled"
+    print("dependabot merge: pr=#%d result=%s" % (number, result), file=sys.stderr)
+    print(json.dumps({"context_updates": {
+        "auto_merge": result,
+        "pr_url": url,
+    }}))
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit("usage: tools.py <prepare|amend|merge> [args]")
+    cmd, rest = sys.argv[1], sys.argv[2:]
+    if cmd == "prepare":
+        prepare(rest)
+    elif cmd == "amend":
+        amend(rest)
+    elif cmd == "merge":
+        merge(rest)
+    else:
+        sys.exit("unknown command %r" % cmd)
+
+
+if __name__ == "__main__":
+    main()
+DEPENDABOT_TOOLS_PY
+python3 -c "import py_compile; py_compile.compile('.git/dependabot-scripts/tools.py', doraise=True)"
+echo "dependabot: helper scripts ready" >&2
+'''

@@ -1,0 +1,74 @@
+digraph Dependabot {
+    graph [
+        goal="Keep dependabot pull request {{ inputs.pr }} mergeable: rebase it onto the latest base branch, verify the repository's tests pass (fixing regressions and re-running until they pass when they do not), amend every change into the pull request's single commit, push, and enable GitHub auto-merge with the rebase strategy.",
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    prepare [
+        label="Validate PR and rebase",
+        shape=parallelogram,
+        output_schema="routing",
+        goal_gate=true,
+        script="test -f .git/dependabot-scripts/tools.py || { echo 'dependabot: helper scripts are missing (fresh sandbox on resume?); start a new run instead of resuming this one' >&2; exit 1; }\npython3 .git/dependabot-scripts/tools.py prepare {{ inputs.pr }}"
+    ]
+
+    test [
+        label="Verify tests",
+        prompt="@prompts/test.md",
+        output_schema="routing",
+        max_visits=6
+    ]
+
+    fix [
+        label="Fix failures",
+        prompt="@prompts/fix.md",
+        output_schema="routing",
+        max_visits=5
+    ]
+
+    amend [
+        label="Amend and push",
+        shape=parallelogram,
+        output_schema="routing",
+        script="python3 .git/dependabot-scripts/tools.py amend"
+    ]
+
+    merge [
+        label="Enable auto-merge",
+        shape=parallelogram,
+        output_schema="routing",
+        goal_gate=true,
+        script="python3 .git/dependabot-scripts/tools.py merge"
+    ]
+
+    fail [
+        label="Fail run",
+        shape=parallelogram,
+        stdin_source="stage_failure",
+        script="set -eu\nMSG=$(cat || true)\nif [ -z \"$MSG\" ]; then\n  MSG=\"a dependabot stage failed; inspect the failing stage output in the run events and .git/dependabot-state.json\"\nfi\nprintf 'dependabot: %s\\n' \"$MSG\" >&2\nexit 1"
+    ]
+
+    start -> prepare
+
+    prepare -> test [condition="outcome=succeeded && context.rebase_conflict!=true"]
+    prepare -> fix [condition="outcome=succeeded && context.rebase_conflict=true"]
+    prepare -> fail
+
+    test -> amend [condition="outcome=succeeded && context.tests_passed=true"]
+    test -> fix [condition="outcome=succeeded && context.tests_passed=false && context.internal.node_visit_count < 5"]
+    test -> fail
+
+    fix -> test [condition="outcome=succeeded"]
+    fix -> fail
+
+    amend -> merge [condition="outcome=succeeded"]
+    amend -> fail
+
+    merge -> exit [condition="outcome=succeeded"]
+    merge -> fail
+
+    fail -> exit
+}

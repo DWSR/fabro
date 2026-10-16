@@ -9,7 +9,7 @@ ready_label = "fabro-ready"
 running_label = "fabro-running"
 
 [run.integrations.github]
-permissions = { contents = "read", issues = "write" }
+permissions = { contents = "read", issues = "write", pull_requests = "read" }
 
 [run.run_branch]
 enabled = false
